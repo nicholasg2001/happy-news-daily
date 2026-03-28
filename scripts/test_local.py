@@ -32,7 +32,7 @@ else:
 lambda_dir = Path(__file__).parent.parent / "lambda"
 sys.path.insert(0, str(lambda_dir))
 
-from news_fetcher import fetch_articles, summarize_with_claude, get_top_positive_stories
+from news_fetcher import fetch_articles, _get_stories_standard, _get_stories_premium, get_top_positive_stories
 from email_sender import send_email
 
 
@@ -58,24 +58,43 @@ def main():
     print("Positive News Mailer — Local Test Run")
     print("=" * 60)
 
-    # Step 1: Fetch RSS
+    tier = os.environ.get("TIER", "standard").lower()
+
+    if tier == "premium":
+        # Premium: Claude Sonnet handles fetch + summarize in one step
+        print("\n[1/2] Searching the web with Claude Sonnet (premium tier)...")
+        stories = _get_stories_premium()
+        print(f"      Got {len(stories)} top stories back from Claude.\n")
+        for i, s in enumerate(stories, 1):
+            print(f"  {i}. {s.get('title', '(no title)')}")
+            print(f"     {s.get('link', '')}")
+            print()
+        print(f"[2/2] Sending email to {os.environ['RECIPIENT_EMAIL']}...")
+        send_email(stories)
+        print("      Done! Check your inbox (and spam folder on first run).")
+        print()
+        print("=" * 60)
+        print("All steps completed successfully. Ready to deploy to AWS.")
+        print("=" * 60)
+        return
+
+    # Standard: fetch RSS then summarize
     print("\n[1/3] Fetching articles from RSS feeds...")
     articles = fetch_articles()
-    print(f"      Fetched {len(articles)} articles from {len(articles)} entries.")
+    print(f"      Fetched {len(articles)} articles.")
     if not articles:
         print("ERROR: No articles fetched. Check your internet connection.")
         sys.exit(1)
 
     # Step 2: Summarize with Claude
     print("\n[2/3] Sending to Claude Haiku for summarization...")
-    stories = summarize_with_claude(articles)
+    stories = _get_stories_standard()
     print(f"      Got {len(stories)} top stories back from Claude.\n")
     for i, s in enumerate(stories, 1):
         print(f"  {i}. {s.get('title', '(no title)')}")
         print(f"     {s.get('link', '')}")
         print()
 
-    # Step 3: Send email
     print(f"[3/3] Sending email to {os.environ['RECIPIENT_EMAIL']}...")
     send_email(stories)
     print("      Done! Check your inbox (and spam folder on first run).")

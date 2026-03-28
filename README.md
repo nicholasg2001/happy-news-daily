@@ -12,7 +12,7 @@ Two tiers to choose from:
 | Tier | Model | News source | Cost/month |
 |------|-------|-------------|------------|
 | `standard` (default) | Claude Haiku | Curated RSS feeds | ~$0.11 |
-| `premium` | Claude Sonnet | Live web search | ~$0.95 |
+| `premium` | Claude Sonnet | Live web search | ~$1.50-1.80 |
 
 All AWS infrastructure (Lambda, EventBridge) runs on the permanent free tier. Email sending is free via Brevo (300 emails/day).
 
@@ -42,13 +42,13 @@ Uses a curated list of positive news RSS feeds (Good News Network, Positive News
 - Limited to sources in `RSS_FEEDS` in `news_fetcher.py`
 - Token spend is tightly capped by guardrail constants in the same file
 
-### Premium (~$0.95/month) (In this economy)
+### Premium (~$1.50-1.80/month)
 
 Claude Sonnet uses the built-in web search tool to find today's positive news from across the internet. Stories are fresher, drawn from a wider range of sources, and written with more nuanced prose.
 
 - Searches the live web for stories published in the last 24-48 hours
 - One web search per run ($0.01/search x 30 days = $0.30/month)
-- Remaining cost is Sonnet token usage (~$0.65/month)
+- Sonnet token usage (~$1.20-1.50/month) — web search results are verbose, typically pushing input tokens to 10,000-15,000 per run
 
 To switch tiers, set `TIER=premium` in your `.env` file or pass `Tier=premium` to `sam deploy`.
 
@@ -293,7 +293,9 @@ A successful run takes 5-20 seconds (standard) or 10-30 seconds (premium, due to
 | AWS Lambda | 30 invocations | 1,000,000/mo | Free |
 | Brevo email | 30 emails | 300/day | Free |
 | Web search | 30 searches | N/A | ~$0.30 |
-| Claude Sonnet tokens | ~135,000 tokens/mo | N/A | ~$0.65 |
+| Claude Sonnet tokens | ~360,000-450,000 tokens/mo | N/A | ~$1.20-1.50 |
+
+Web search results are verbose — real-world input token counts run 10,000-15,000 per invocation, higher than the pre-launch estimate.
 
 ---
 
@@ -332,6 +334,14 @@ A successful run takes 5-20 seconds (standard) or 10-30 seconds (premium, due to
 - No web UI — configured once at deploy time via SAM parameters.
 - Retries are disabled at both the Lambda layer (`MaximumRetryAttempts: 0`) and the EventBridge Scheduler layer (`RetryPolicy.MaximumRetryAttempts: 0`). A failed run is logged to CloudWatch and nothing is retried, preventing accidental double charges.
 - Reserved concurrency is set to 1, blocking any parallel invocations.
+
+---
+
+## TODO
+
+- [ ] Tag each story with a category (Science, Environment, Health, etc.) and group them in the email
+- [ ] Port to other cloud providers (GCP Cloud Scheduler + Cloud Run, Cloudflare Workers, Azure Functions)
+- [ ] Fully self-hosted option: local cron + Ollama in place of Lambda + Claude API
 
 ---
 

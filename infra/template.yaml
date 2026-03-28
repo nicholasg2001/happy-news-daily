@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   positive-news-mailer — Daily positive news digest via Claude + Brevo.
-  Standard tier (Haiku + RSS): ~$0.11/month. Premium tier (Sonnet + web search): ~$0.95/month.
+  Standard tier (Haiku + RSS): ~$0.11/month. Premium tier (Sonnet + web search): ~$1.50-1.80/month.
   All AWS infrastructure runs on the permanent free tier.
 
 Parameters:
@@ -60,13 +60,13 @@ Parameters:
       - premium
     Description: >
       standard: Claude Haiku + RSS feeds (~$0.11/month).
-      premium:  Claude Sonnet + live web search (~$0.95/month) — fresher stories, better prose.
+      premium:  Claude Sonnet + live web search (~$1.50-1.80/month) — fresher stories, better prose.
 
 Globals:
   Function:
     Timeout: 60
     MemorySize: 256
-    Runtime: python3.12
+    Runtime: python3.13
     Environment:
       Variables:
         ANTHROPIC_API_KEY: !Ref AnthropicApiKey
@@ -85,14 +85,9 @@ Resources:
       CodeUri: ../lambda/
       Handler: handler.handler
       Description: "Fetches positive news via Claude and emails a daily digest (standard or premium tier)"
-      # Guardrail: hard limit on concurrent executions.
-      # Prevents runaway parallel invocations (e.g. manual test + scheduled run overlapping).
-      ReservedConcurrentExecutions: 1
-      # Guardrail: disable Lambda's built-in async retry behaviour.
-      # By default Lambda retries a failed async invocation up to 2 times — that would
-      # triple the Claude API cost on any error. We handle failures via CloudWatch logs instead.
+      ReservedConcurrentExecutions: 1  # prevents parallel invocations
       EventInvokeConfig:
-        MaximumRetryAttempts: 0
+        MaximumRetryAttempts: 0  # Lambda retries are disabled to avoid double Claude charges
       Policies:
         - CloudWatchLogsFullAccess
 
@@ -108,11 +103,8 @@ Resources:
       Target:
         Arn: !GetAtt PositiveNewsFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
-        # Guardrail: disable EventBridge Scheduler's own retry on delivery failure.
-        # Without this, a Lambda throttle (e.g. concurrency limit hit) would cause
-        # EventBridge to retry, potentially triggering a second Claude API call.
         RetryPolicy:
-          MaximumRetryAttempts: 0
+          MaximumRetryAttempts: 0  # EventBridge retries are also disabled
 
   SchedulerRole:
     Type: AWS::IAM::Role

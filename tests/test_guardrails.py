@@ -361,6 +361,25 @@ class TestStandardTier:
         assert len(result) == 5
         assert result[0]["title"] == "Story 0"
 
+    @patch("news_fetcher.Anthropic")
+    def test_preamble_before_fenced_json(self, mock_anthropic_cls):
+        """Handles Claude adding a text preamble before the JSON code fence."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        stories = sample_stories(n=5)
+        with_preamble = f"Here are the top stories:\n\n```json\n{json.dumps(stories)}\n```"
+        resp = MagicMock()
+        resp.content = [MagicMock(text=with_preamble, type="text")]
+        resp.usage = MagicMock(input_tokens=100, output_tokens=200)
+        mock_client.messages.create.return_value = resp
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                result = _get_stories_standard()
+
+        assert len(result) == 5
+        assert result[0]["title"] == "Story 0"
+
 
 # ---------------------------------------------------------------------------
 # Premium tier: API call parameters and output guardrails

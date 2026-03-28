@@ -7,10 +7,6 @@ from email_sender import send_email
 
 
 def handler(event, context):
-    """
-    Lambda handler. Invoked daily by EventBridge Scheduler.
-    Fetches positive news via RSS + Claude Haiku, then sends an email via Brevo.
-    """
     try:
         print("Fetching positive news stories...")
         stories = get_top_positive_stories()
