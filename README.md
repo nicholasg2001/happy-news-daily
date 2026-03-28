@@ -37,7 +37,7 @@ Uses a curated list of positive news RSS feeds (Good News Network, Positive News
 - Limited to sources in `RSS_FEEDS` in `news_fetcher.py`
 - Token spend is tightly capped by guardrail constants in the same file
 
-### Premium (~$0.95/month)
+### Premium (~$0.95/month) (In this economy)
 
 Claude Sonnet uses the built-in web search tool to find today's positive news from across the internet. Stories are fresher, drawn from a wider range of sources, and written with more nuanced prose.
 
