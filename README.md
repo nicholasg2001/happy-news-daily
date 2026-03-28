@@ -1,5 +1,7 @@
 # Positive News Mailer
 
+Social media spoon feeds us garbage that keeps us in a negative feedback loop. Sh*t really can be sweet though. Turn off Instagram.
+
 A self-hosted AWS app that sends you a daily email digest of uplifting news from around the world, curated by Claude Haiki or Sonnet. Because who can afford to use Opus for this?
 
 Two tiers to choose from:
