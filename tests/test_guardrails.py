@@ -2,7 +2,8 @@
 Guardrail tests for news_fetcher.py.
 
 These tests do NOT call the real Claude API or real RSS feeds — everything is mocked.
-They verify that the budget constants are respected and that edge cases are handled safely.
+They verify that budget constants are respected and edge cases are handled safely
+across both the standard (Haiku + RSS) and premium (Sonnet + web search) tiers.
 
 Run with:
     pip install pytest anthropic feedparser
@@ -11,9 +12,8 @@ Run with:
 
 import json
 import sys
-import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,8 +26,11 @@ from news_fetcher import (
     MAX_PROMPT_CHARS,
     MAX_SUMMARY_CHARS,
     MAX_TOTAL_ARTICLES,
+    PREMIUM_MAX_TOKENS,
+    PREMIUM_MAX_USES,
     fetch_articles,
-    summarize_with_claude,
+    _get_stories_standard,
+    _get_stories_premium,
 )
 
 
@@ -36,7 +39,6 @@ from news_fetcher import (
 # ---------------------------------------------------------------------------
 
 def make_feed_entry(title="Headline", summary="Some summary text.", link="https://example.com/story"):
-    """Return a minimal feedparser-style entry object."""
     entry = MagicMock()
     entry.title = title
     entry.summary = summary
@@ -52,12 +54,45 @@ def make_feed(entries):
     return feed
 
 
-def make_claude_response(stories: list[dict], input_tokens=400, output_tokens=300):
-    """Return a mock Anthropic API response containing the given stories as JSON."""
+def make_standard_response(stories: list[dict], input_tokens=400, output_tokens=300):
+    """Mock Anthropic response for standard tier (single text content block)."""
     response = MagicMock()
-    response.content = [MagicMock(text=json.dumps(stories))]
+    response.content = [MagicMock(text=json.dumps(stories), type="text")]
     response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
     return response
+
+
+def make_premium_response(stories: list[dict], input_tokens=2000, output_tokens=600):
+    """Mock Anthropic response for premium tier (mixed content blocks including text)."""
+    # Simulate a response that includes a server_tool_use block followed by a text block,
+    # as the web_search tool generates before Claude's final answer.
+    tool_block = MagicMock()
+    tool_block.type = "server_tool_use"
+    # No .text attribute on tool blocks — accessing it should not be needed.
+    del tool_block.text
+
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = json.dumps(stories)
+
+    response = MagicMock()
+    response.content = [tool_block, text_block]
+    response.usage = MagicMock(input_tokens=input_tokens, output_tokens=output_tokens)
+    return response
+
+
+def sample_stories(n=5):
+    return [
+        {"title": f"Story {i}", "summary": f"Summary {i}.", "link": f"https://ex.com/{i}"}
+        for i in range(n)
+    ]
+
+
+def sample_articles(n=10):
+    return [
+        {"title": f"Article {i}", "summary": "Short summary.", "link": f"https://ex.com/{i}"}
+        for i in range(n)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -66,27 +101,26 @@ def make_claude_response(stories: list[dict], input_tokens=400, output_tokens=30
 
 class TestBudgetConstants:
     """
-    These tests will fail if someone raises the guardrail constants beyond safe limits.
-    They act as a tripwire — any change that increases token spend must also update
-    the thresholds here intentionally.
+    These tests fail if any guardrail constant is raised beyond its safe limit.
+    They are intentional tripwires — a change here must be made consciously.
+    Standard tier constants only; premium tier limits are tested separately.
     """
 
     def test_max_articles_per_feed_within_limit(self):
         assert MAX_ARTICLES_PER_FEED <= 3, (
             f"MAX_ARTICLES_PER_FEED={MAX_ARTICLES_PER_FEED} exceeds safe limit of 3. "
-            "Raising this increases token input. Update the threshold here if intentional."
+            "Raising this increases token input. Update this threshold if intentional."
         )
 
     def test_max_total_articles_within_limit(self):
         assert MAX_TOTAL_ARTICLES <= 15, (
-            f"MAX_TOTAL_ARTICLES={MAX_TOTAL_ARTICLES} exceeds safe limit of 15. "
-            "Update this test if you intentionally want to raise it."
+            f"MAX_TOTAL_ARTICLES={MAX_TOTAL_ARTICLES} exceeds safe limit of 15."
         )
 
     def test_max_summary_chars_within_limit(self):
         assert MAX_SUMMARY_CHARS <= 250, (
             f"MAX_SUMMARY_CHARS={MAX_SUMMARY_CHARS} exceeds safe limit of 250. "
-            "Each extra 4 chars ≈ 1 extra token sent to Claude."
+            "Each extra 4 chars is ~1 extra token sent to Claude."
         )
 
     def test_max_prompt_chars_within_limit(self):
@@ -94,11 +128,23 @@ class TestBudgetConstants:
             f"MAX_PROMPT_CHARS={MAX_PROMPT_CHARS} exceeds safe limit of 6000 chars (~1500 tokens)."
         )
 
+    def test_premium_max_uses_within_limit(self):
+        assert PREMIUM_MAX_USES <= 1, (
+            f"PREMIUM_MAX_USES={PREMIUM_MAX_USES} exceeds safe limit of 1. "
+            "Each web search costs $0.01. Raising this raises the monthly ceiling."
+        )
+
+    def test_premium_max_tokens_within_limit(self):
+        assert PREMIUM_MAX_TOKENS <= 1200, (
+            f"PREMIUM_MAX_TOKENS={PREMIUM_MAX_TOKENS} exceeds safe limit of 1200. "
+            "At Sonnet output pricing ($15/M), each extra 1000 tokens adds $0.45/month."
+        )
+
     def test_worst_case_articles_text_fits_prompt_budget(self):
         """
-        Simulate worst-case article sizes and confirm the drop-loop keeps us under budget.
-        A title of 100 chars + summary of 250 chars + URL of 100 chars + formatting = ~480 chars.
-        15 such articles = 7,200 chars — over budget. The drop-loop must bring it down.
+        Worst-case article sizes must stay under MAX_PROMPT_CHARS after the drop-loop.
+        title=100 chars, summary=MAX_SUMMARY_CHARS, URL=100 chars → ~480 chars/article.
+        15 such articles = 7,200 chars > 6,000, so the drop-loop must bring it down.
         """
         long_title = "A" * 100
         long_summary = "B" * MAX_SUMMARY_CHARS
@@ -108,7 +154,6 @@ class TestBudgetConstants:
             for _ in range(MAX_TOTAL_ARTICLES)
         ]
 
-        # Simulate the drop-loop logic from summarize_with_claude
         def build_text(arts):
             return "\n\n".join(
                 f"[{i+1}] Title: {a['title']}\nSummary: {a['summary']}\nURL: {a['link']}"
@@ -122,227 +167,336 @@ class TestBudgetConstants:
             text = build_text(arts)
 
         assert len(text) <= MAX_PROMPT_CHARS, (
-            f"Even after dropping articles, prompt is {len(text)} chars > {MAX_PROMPT_CHARS}. "
-            "Reduce MAX_SUMMARY_CHARS or MAX_PROMPT_CHARS."
+            f"Even after dropping articles, prompt is {len(text)} chars > {MAX_PROMPT_CHARS}."
         )
-        assert len(arts) >= 1, "All articles were dropped — something is very wrong."
+        assert len(arts) >= 1
 
 
 # ---------------------------------------------------------------------------
-# fetch_articles: RSS parsing and per-feed caps
+# fetch_articles: RSS parsing and per-feed caps (standard tier)
 # ---------------------------------------------------------------------------
 
 class TestFetchArticles:
-    def _make_feed_with_n_entries(self, n, title_prefix="Story"):
+    # feedparser is imported inside fetch_articles(), so we patch feedparser.parse directly.
+    def _feed_with_n_entries(self, n):
         return make_feed([
-            make_feed_entry(title=f"{title_prefix} {i}", summary="x" * 300, link=f"https://ex.com/{i}")
+            make_feed_entry(title=f"Story {i}", summary="x" * 300, link=f"https://ex.com/{i}")
             for i in range(n)
         ])
 
-    @patch("news_fetcher.feedparser")
-    def test_per_feed_cap_respected(self, mock_feedparser):
-        """Never takes more than MAX_ARTICLES_PER_FEED entries from a single feed."""
-        big_feed = self._make_feed_with_n_entries(20)
-        mock_feedparser.parse.return_value = big_feed
-
+    @patch("feedparser.parse")
+    def test_per_feed_cap_respected(self, mock_parse):
+        mock_parse.return_value = self._feed_with_n_entries(20)
         with patch.object(news_fetcher, "RSS_FEEDS", ["https://feed1.example.com/"]):
             articles = fetch_articles()
-
         assert len(articles) == MAX_ARTICLES_PER_FEED
 
-    @patch("news_fetcher.feedparser")
-    def test_total_article_cap_respected(self, mock_feedparser):
-        """Total articles never exceeds MAX_TOTAL_ARTICLES even with many feeds."""
-        big_feed = self._make_feed_with_n_entries(MAX_ARTICLES_PER_FEED)
-        mock_feedparser.parse.return_value = big_feed
-
-        # Use enough fake feeds to exceed MAX_TOTAL_ARTICLES
+    @patch("feedparser.parse")
+    def test_total_article_cap_respected(self, mock_parse):
+        mock_parse.return_value = self._feed_with_n_entries(MAX_ARTICLES_PER_FEED)
         many_feeds = [f"https://feed{i}.example.com/" for i in range(20)]
         with patch.object(news_fetcher, "RSS_FEEDS", many_feeds):
             articles = fetch_articles()
-
         assert len(articles) <= MAX_TOTAL_ARTICLES
 
-    @patch("news_fetcher.feedparser")
-    def test_summary_truncated_to_max_chars(self, mock_feedparser):
-        """Summaries are truncated to MAX_SUMMARY_CHARS before being stored."""
-        long_summary = "X" * 1000
-        feed = make_feed([make_feed_entry(summary=long_summary)])
-        mock_feedparser.parse.return_value = feed
-
+    @patch("feedparser.parse")
+    def test_summary_truncated_to_max_chars(self, mock_parse):
+        mock_parse.return_value = make_feed([make_feed_entry(summary="X" * 1000)])
         with patch.object(news_fetcher, "RSS_FEEDS", ["https://feed.example.com/"]):
             articles = fetch_articles()
-
-        assert len(articles) == 1
         assert len(articles[0]["summary"]) <= MAX_SUMMARY_CHARS
 
-    @patch("news_fetcher.feedparser")
-    def test_html_stripped_from_summary(self, mock_feedparser):
-        """HTML tags are removed from summaries."""
-        feed = make_feed([make_feed_entry(summary="<p>Hello <b>world</b></p>")])
-        mock_feedparser.parse.return_value = feed
-
+    @patch("feedparser.parse")
+    def test_html_stripped_from_summary(self, mock_parse):
+        mock_parse.return_value = make_feed([make_feed_entry(summary="<p>Hello <b>world</b></p>")])
         with patch.object(news_fetcher, "RSS_FEEDS", ["https://feed.example.com/"]):
             articles = fetch_articles()
-
         assert "<" not in articles[0]["summary"]
         assert "Hello" in articles[0]["summary"]
-        assert "world" in articles[0]["summary"]
 
-    @patch("news_fetcher.feedparser")
-    def test_failed_feed_is_skipped(self, mock_feedparser):
-        """A feed that raises an exception is silently skipped; others still work."""
+    @patch("feedparser.parse")
+    def test_failed_feed_is_skipped(self, mock_parse):
         good_feed = make_feed([make_feed_entry(title="Good story")])
-        mock_feedparser.parse.side_effect = [Exception("timeout"), good_feed]
-
+        mock_parse.side_effect = [Exception("timeout"), good_feed]
         with patch.object(news_fetcher, "RSS_FEEDS", ["https://bad.example.com/", "https://good.example.com/"]):
             articles = fetch_articles()
-
         assert len(articles) == 1
         assert articles[0]["title"] == "Good story"
 
 
 # ---------------------------------------------------------------------------
-# summarize_with_claude: API call parameters and output guardrails
+# Standard tier: API call parameters and output guardrails
 # ---------------------------------------------------------------------------
 
-class TestSummarizeWithClaude:
-    def _sample_stories(self, n=5):
-        return [
-            {"title": f"Story {i}", "summary": f"Summary {i}.", "link": f"https://ex.com/{i}"}
-            for i in range(n)
-        ]
-
-    def _sample_articles(self, n=10):
-        return [
-            {"title": f"Article {i}", "summary": "Short summary.", "link": f"https://ex.com/{i}"}
-            for i in range(n)
-        ]
-
+class TestStandardTier:
     @patch("news_fetcher.Anthropic")
-    def test_model_is_haiku(self, mock_anthropic_cls):
-        """Always uses claude-haiku, never a more expensive model."""
+    def test_uses_haiku_model(self, mock_anthropic_cls):
+        """Standard tier must always use claude-haiku — never a more expensive model."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        mock_client.messages.create.return_value = make_claude_response(self._sample_stories())
+        mock_client.messages.create.return_value = make_standard_response(sample_stories())
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                _get_stories_standard()
 
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["model"] == "claude-haiku-4-5-20251001", (
-            f"Expected claude-haiku-4-5-20251001, got {call_kwargs['model']}. "
-            "Using a more expensive model would blow the cost estimate."
+        model = mock_client.messages.create.call_args.kwargs["model"]
+        assert model == "claude-haiku-4-5-20251001", (
+            f"Expected claude-haiku-4-5-20251001, got {model!r}. "
+            "Switching to a pricier model will blow the cost estimate."
         )
 
     @patch("news_fetcher.Anthropic")
     def test_max_tokens_enforced(self, mock_anthropic_cls):
-        """max_tokens must be 800 or less — never raised without updating this test."""
+        """Standard tier max_tokens must be <= 800."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        mock_client.messages.create.return_value = make_claude_response(self._sample_stories())
+        mock_client.messages.create.return_value = make_standard_response(sample_stories())
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                _get_stories_standard()
+
+        max_tokens = mock_client.messages.create.call_args.kwargs["max_tokens"]
+        assert max_tokens <= 800, f"max_tokens={max_tokens} exceeds safe limit of 800."
+
+    @patch("news_fetcher.Anthropic")
+    def test_no_web_search_tool(self, mock_anthropic_cls):
+        """Standard tier must not use the web_search tool (it costs $10/1000 searches)."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_standard_response(sample_stories())
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                _get_stories_standard()
 
         call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert call_kwargs["max_tokens"] <= 800, (
-            f"max_tokens={call_kwargs['max_tokens']} exceeds the safe limit of 800. "
-            "Each extra token costs money and can exceed what 5 JSON story objects need."
+        assert "tools" not in call_kwargs, (
+            "Standard tier passed tools to Claude. web_search costs $10/1000 searches."
         )
 
     @patch("news_fetcher.Anthropic")
     def test_prompt_respects_char_budget(self, mock_anthropic_cls):
-        """The prompt sent to Claude never exceeds MAX_PROMPT_CHARS in its article section."""
+        """Prompt articles block stays within MAX_PROMPT_CHARS even with fat articles."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        mock_client.messages.create.return_value = make_claude_response(self._sample_stories())
+        mock_client.messages.create.return_value = make_standard_response(sample_stories())
 
-        # Generate articles that would exceed budget if not dropped
         fat_articles = [
             {"title": "T" * 100, "summary": "S" * MAX_SUMMARY_CHARS, "link": "https://ex.com/" + "l" * 80}
             for _ in range(MAX_TOTAL_ARTICLES)
         ]
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            summarize_with_claude(fat_articles)
+            with patch("news_fetcher.fetch_articles", return_value=fat_articles):
+                _get_stories_standard()
 
         prompt_sent = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
-        # The article section is everything between the instruction prefix and suffix
-        assert len(prompt_sent) <= MAX_PROMPT_CHARS + 600, (
-            # 600 chars of slack for the fixed instruction text surrounding articles_text
-            f"Full prompt is {len(prompt_sent)} chars, which is unexpectedly large."
-        )
+        # 600 chars of slack for the fixed instruction text surrounding articles_text
+        assert len(prompt_sent) <= MAX_PROMPT_CHARS + 600
 
     @patch("news_fetcher.Anthropic")
-    def test_output_capped_at_5_stories(self, mock_anthropic_cls):
-        """Even if Claude returns more than 5 stories, we only use 5."""
+    def test_output_capped_at_5(self, mock_anthropic_cls):
+        """Standard tier returns at most 5 stories even if Claude returns more."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        mock_client.messages.create.return_value = make_claude_response(self._sample_stories(n=10))
+        mock_client.messages.create.return_value = make_standard_response(sample_stories(n=10))
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            result = summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                result = _get_stories_standard()
 
         assert len(result) == 5
-
-    @patch("news_fetcher.Anthropic")
-    def test_empty_articles_returns_empty(self, mock_anthropic_cls):
-        """If no articles are passed in, Claude is never called and we return []."""
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
-
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            result = summarize_with_claude([])
-
-        mock_client.messages.create.assert_not_called()
-        assert result == []
 
     @patch("news_fetcher.Anthropic")
     def test_token_usage_is_logged(self, mock_anthropic_cls, capsys):
-        """Token usage is printed to stdout so it appears in CloudWatch Logs."""
+        """Token usage must be printed so it appears in CloudWatch Logs."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        mock_client.messages.create.return_value = make_claude_response(
-            self._sample_stories(), input_tokens=1234, output_tokens=567
+        mock_client.messages.create.return_value = make_standard_response(
+            sample_stories(), input_tokens=1234, output_tokens=567
         )
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                _get_stories_standard()
 
-        output = capsys.readouterr().out
-        assert "1234" in output, "input_tokens not logged"
-        assert "567" in output, "output_tokens not logged"
-        assert "estimated cost" in output.lower()
+        out = capsys.readouterr().out
+        assert "1234" in out
+        assert "567" in out
+        assert "estimated cost" in out.lower()
 
     @patch("news_fetcher.Anthropic")
     def test_invalid_json_raises_value_error(self, mock_anthropic_cls):
-        """Truncated or garbled JSON from Claude raises ValueError with context."""
+        """Truncated or garbled JSON raises ValueError with context."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        bad_response = MagicMock()
-        bad_response.content = [MagicMock(text='[{"title": "incomplete')]
-        bad_response.usage = MagicMock(input_tokens=100, output_tokens=50)
-        mock_client.messages.create.return_value = bad_response
+        bad = MagicMock()
+        bad.content = [MagicMock(text='[{"title": "incomplete', type="text")]
+        bad.usage = MagicMock(input_tokens=100, output_tokens=50)
+        mock_client.messages.create.return_value = bad
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            with pytest.raises(ValueError, match="invalid JSON"):
-                summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                with pytest.raises(ValueError, match="invalid JSON"):
+                    _get_stories_standard()
 
     @patch("news_fetcher.Anthropic")
-    def test_markdown_code_fences_stripped(self, mock_anthropic_cls):
+    def test_markdown_fences_stripped(self, mock_anthropic_cls):
         """Handles Claude wrapping JSON in ```json ... ``` code fences."""
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
-        stories = self._sample_stories(n=5)
+        stories = sample_stories(n=5)
         fenced = f"```json\n{json.dumps(stories)}\n```"
-        response = MagicMock()
-        response.content = [MagicMock(text=fenced)]
-        response.usage = MagicMock(input_tokens=100, output_tokens=200)
-        mock_client.messages.create.return_value = response
+        resp = MagicMock()
+        resp.content = [MagicMock(text=fenced, type="text")]
+        resp.usage = MagicMock(input_tokens=100, output_tokens=200)
+        mock_client.messages.create.return_value = resp
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            result = summarize_with_claude(self._sample_articles())
+            with patch("news_fetcher.fetch_articles", return_value=sample_articles()):
+                result = _get_stories_standard()
 
         assert len(result) == 5
         assert result[0]["title"] == "Story 0"
+
+
+# ---------------------------------------------------------------------------
+# Premium tier: API call parameters and output guardrails
+# ---------------------------------------------------------------------------
+
+class TestPremiumTier:
+    @patch("news_fetcher.Anthropic")
+    def test_uses_sonnet_model(self, mock_anthropic_cls):
+        """Premium tier must use claude-sonnet-4-6."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories())
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            _get_stories_premium()
+
+        model = mock_client.messages.create.call_args.kwargs["model"]
+        assert model == "claude-sonnet-4-6", (
+            f"Expected claude-sonnet-4-6, got {model!r}."
+        )
+
+    @patch("news_fetcher.Anthropic")
+    def test_max_tokens_enforced(self, mock_anthropic_cls):
+        """Premium tier max_tokens must be <= PREMIUM_MAX_TOKENS (1200)."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories())
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            _get_stories_premium()
+
+        max_tokens = mock_client.messages.create.call_args.kwargs["max_tokens"]
+        assert max_tokens <= PREMIUM_MAX_TOKENS, (
+            f"max_tokens={max_tokens} exceeds PREMIUM_MAX_TOKENS={PREMIUM_MAX_TOKENS}."
+        )
+
+    @patch("news_fetcher.Anthropic")
+    def test_web_search_tool_present(self, mock_anthropic_cls):
+        """Premium tier must pass the web_search tool."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories())
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            _get_stories_premium()
+
+        tools = mock_client.messages.create.call_args.kwargs.get("tools", [])
+        tool_types = [t.get("type") for t in tools]
+        assert "web_search_20250305" in tool_types, (
+            "Premium tier did not pass web_search_20250305 tool."
+        )
+
+    @patch("news_fetcher.Anthropic")
+    def test_web_search_max_uses_enforced(self, mock_anthropic_cls):
+        """Premium tier max_uses must be <= PREMIUM_MAX_USES (1) to cap search costs."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories())
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            _get_stories_premium()
+
+        tools = mock_client.messages.create.call_args.kwargs.get("tools", [])
+        web_search_tool = next(t for t in tools if t.get("type") == "web_search_20250305")
+        assert web_search_tool.get("max_uses", 1) <= PREMIUM_MAX_USES, (
+            f"web_search max_uses exceeds PREMIUM_MAX_USES={PREMIUM_MAX_USES}. "
+            "Each search costs $0.01; this caps the monthly search spend."
+        )
+
+    @patch("news_fetcher.Anthropic")
+    def test_extracts_text_blocks_only(self, mock_anthropic_cls):
+        """Premium tier skips server_tool_use blocks and only reads text blocks."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories(n=5))
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            result = _get_stories_premium()
+
+        assert len(result) == 5
+        assert result[0]["title"] == "Story 0"
+
+    @patch("news_fetcher.Anthropic")
+    def test_output_capped_at_5(self, mock_anthropic_cls):
+        """Premium tier returns at most 5 stories even if Claude returns more."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(sample_stories(n=10))
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            result = _get_stories_premium()
+
+        assert len(result) == 5
+
+    @patch("news_fetcher.Anthropic")
+    def test_token_usage_logged_with_search_cost(self, mock_anthropic_cls, capsys):
+        """Premium tier logs token usage and mentions web search cost."""
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = make_premium_response(
+            sample_stories(), input_tokens=3000, output_tokens=700
+        )
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            _get_stories_premium()
+
+        out = capsys.readouterr().out
+        assert "3000" in out
+        assert "700" in out
+        assert "web search" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tier dispatch via TIER env var
+# ---------------------------------------------------------------------------
+
+class TestTierDispatch:
+    @patch("news_fetcher._get_stories_standard")
+    def test_default_tier_is_standard(self, mock_standard):
+        mock_standard.return_value = sample_stories()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
+            os_env = {k: v for k, v in __import__("os").environ.items() if k != "TIER"}
+            with patch.dict("os.environ", os_env, clear=True):
+                news_fetcher.get_top_positive_stories()
+        mock_standard.assert_called_once()
+
+    @patch("news_fetcher._get_stories_standard")
+    def test_tier_standard_explicit(self, mock_standard):
+        mock_standard.return_value = sample_stories()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key", "TIER": "standard"}):
+            news_fetcher.get_top_positive_stories()
+        mock_standard.assert_called_once()
+
+    @patch("news_fetcher._get_stories_premium")
+    def test_tier_premium(self, mock_premium):
+        mock_premium.return_value = sample_stories()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key", "TIER": "premium"}):
+            news_fetcher.get_top_positive_stories()
+        mock_premium.assert_called_once()

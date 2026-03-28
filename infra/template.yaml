@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  positive-news-mailer — Daily positive news digest via Claude Haiku + Brevo.
-  Costs ~$0.004/month (just Claude token usage). All AWS resources are free tier.
+  positive-news-mailer — Daily positive news digest via Claude + Brevo.
+  Standard tier (Haiku + RSS): ~$0.11/month. Premium tier (Sonnet + web search): ~$0.95/month.
+  All AWS infrastructure runs on the permanent free tier.
 
 Parameters:
   AnthropicApiKey:
@@ -51,6 +52,16 @@ Parameters:
     Default: "America/New_York"
     Description: "IANA timezone for the send time (e.g. America/Chicago, Europe/London)"
 
+  Tier:
+    Type: String
+    Default: "standard"
+    AllowedValues:
+      - standard
+      - premium
+    Description: >
+      standard: Claude Haiku + RSS feeds (~$0.11/month).
+      premium:  Claude Sonnet + live web search (~$0.95/month) — fresher stories, better prose.
+
 Globals:
   Function:
     Timeout: 60
@@ -64,6 +75,7 @@ Globals:
         SENDER_NAME: !Ref SenderName
         BREVO_SMTP_USER: !Ref BrevoSmtpUser
         BREVO_SMTP_KEY: !Ref BrevoSmtpKey
+        TIER: !Ref Tier
 
 Resources:
   PositiveNewsFunction:
@@ -72,7 +84,7 @@ Resources:
       FunctionName: positive-news-mailer
       CodeUri: ../lambda/
       Handler: handler.handler
-      Description: "Fetches positive news via RSS + Claude Haiku and emails a daily digest"
+      Description: "Fetches positive news via Claude and emails a daily digest (standard or premium tier)"
       # Guardrail: hard limit on concurrent executions.
       # Prevents runaway parallel invocations (e.g. manual test + scheduled run overlapping).
       ReservedConcurrentExecutions: 1
