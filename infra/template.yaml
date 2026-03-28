@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  positive-news-mailer — Daily positive news digest via Claude Haiku + Brevo.
+  Costs ~$0.004/month (just Claude token usage). All AWS resources are free tier.
+
+Parameters:
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Your Anthropic API key (get one at https://console.anthropic.com/)"
+
+  RecipientEmail:
+    Type: String
+    Description: "Email address to deliver the daily digest to"
+
+  SenderEmail:
+    Type: String
+    Description: "From address (must be a verified sender in your Brevo account)"
+
+  SenderName:
+    Type: String
+    Default: "Positive News Digest"
+    Description: "Display name shown in the From field"
+
+  BrevoSmtpUser:
+    Type: String
+    Description: "Your Brevo account login email (used as SMTP username)"
+
+  BrevoSmtpKey:
+    Type: String
+    NoEcho: true
+    Description: "Your Brevo SMTP key (from Brevo → Settings → SMTP & API)"
+
+  SendHour:
+    Type: Number
+    Default: 9
+    MinValue: 0
+    MaxValue: 23
+    Description: "Hour of day to send the digest (0-23, in SendTimezone)"
+
+  SendMinute:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 59
+    Description: "Minute of hour to send the digest (0-59)"
+
+  SendTimezone:
+    Type: String
+    Default: "America/New_York"
+    Description: "IANA timezone for the send time (e.g. America/Chicago, Europe/London)"
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.12
+    Environment:
+      Variables:
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        RECIPIENT_EMAIL: !Ref RecipientEmail
+        SENDER_EMAIL: !Ref SenderEmail
+        SENDER_NAME: !Ref SenderName
+        BREVO_SMTP_USER: !Ref BrevoSmtpUser
+        BREVO_SMTP_KEY: !Ref BrevoSmtpKey
+
+Resources:
+  PositiveNewsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: positive-news-mailer
+      CodeUri: ../lambda/
+      Handler: handler.handler
+      Description: "Fetches positive news via RSS + Claude Haiku and emails a daily digest"
+      # Guardrail: hard limit on concurrent executions.
+      # Prevents runaway parallel invocations (e.g. manual test + scheduled run overlapping).
+      ReservedConcurrentExecutions: 1
+      # Guardrail: disable Lambda's built-in async retry behaviour.
+      # By default Lambda retries a failed async invocation up to 2 times — that would
+      # triple the Claude API cost on any error. We handle failures via CloudWatch logs instead.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Policies:
+        - CloudWatchLogsFullAccess
+
+  PositiveNewsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: positive-news-mailer-daily
+      Description: "Triggers the positive news mailer daily at the configured time"
+      ScheduleExpression: !Sub "cron(${SendMinute} ${SendHour} * * ? *)"
+      ScheduleExpressionTimezone: !Ref SendTimezone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt PositiveNewsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        # Guardrail: disable EventBridge Scheduler's own retry on delivery failure.
+        # Without this, a Lambda throttle (e.g. concurrency limit hit) would cause
+        # EventBridge to retry, potentially triggering a second Claude API call.
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: positive-news-mailer-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt PositiveNewsFunction.Arn
+
+Outputs:
+  FunctionArn:
+    Description: "Lambda function ARN"
+    Value: !GetAtt PositiveNewsFunction.Arn
+
+  ScheduleArn:
+    Description: "EventBridge Scheduler rule ARN"
+    Value: !GetAtt PositiveNewsSchedule.Arn
+
+  LogGroup:
+    Description: "CloudWatch Logs URL (replace REGION with your AWS region)"
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252Fpositive-news-mailer"
