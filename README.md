@@ -2,7 +2,7 @@
 
 Social media spoon feeds us garbage that keeps us in a negative feedback loop. Sh*t really can be sweet though. Turn off Instagram.
 
-A self-hosted AWS app that sends you a daily email digest of uplifting news from around the world, curated by Claude Haiki or Sonnet. Because who can afford to use Opus for this?
+Simple python script that sends you a daily email digest of uplifting news from around the world, curated by Claude Haiki or Sonnet. Because who can afford to use Opus for this?
 
 <img width="600" height="750" alt="image" src="https://github.com/user-attachments/assets/295a11d7-1f27-4178-b7d6-bab2b3ef2301" />
 
